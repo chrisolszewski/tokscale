@@ -60,6 +60,10 @@ pub struct ScannerSettings {
     /// so the JSON stays stable and human-editable.
     #[serde(default)]
     pub extra_scan_paths: BTreeMap<String, Vec<PathBuf>>,
+    /// Runtime-only fast-path: when a bounded OpenCode report is using SQLite,
+    /// skip the legacy JSON tree instead of walking it just to dedupe overlap.
+    #[serde(skip)]
+    pub skip_opencode_legacy_json_when_sqlite_exists: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1019,12 +1023,16 @@ fn scan_all_clients_with_env_strategy_inner(
             .data()
             .resolve_path_with_env_strategy(home_dir, use_env_roots);
         result.opencode_json_dir = Some(PathBuf::from(&opencode_path));
-        push_unique_scan_task(
-            &mut tasks,
-            &mut seen_scan_roots,
-            ClientId::OpenCode,
-            opencode_path,
-        );
+        if result.opencode_dbs.is_empty()
+            || !scanner_settings.skip_opencode_legacy_json_when_sqlite_exists
+        {
+            push_unique_scan_task(
+                &mut tasks,
+                &mut seen_scan_roots,
+                ClientId::OpenCode,
+                opencode_path,
+            );
+        }
     }
 
     // MiMo Code: SQLite database(s) at ~/.local/share/mimocode/mimocode*.db
@@ -2241,6 +2249,49 @@ mod tests {
         );
 
         restore_env("XDG_DATA_HOME", previous_xdg);
+    }
+
+    #[test]
+    #[serial]
+    fn test_opencode_legacy_json_skip_is_explicit_sqlite_fast_path() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        setup_mock_opencode_dir(home);
+
+        let clients = ["opencode".to_string()];
+        let mut fast_path_settings = ScannerSettings::default();
+        fast_path_settings.skip_opencode_legacy_json_when_sqlite_exists = true;
+
+        let no_db = scan_all_clients_with_scanner_settings(
+            home.to_str().unwrap(),
+            &clients,
+            false,
+            &fast_path_settings,
+        );
+        assert_eq!(no_db.get(ClientId::OpenCode).len(), 1);
+        assert!(no_db.opencode_dbs.is_empty());
+
+        let db_dir = home.join(".local/share/opencode");
+        fs::create_dir_all(&db_dir).unwrap();
+        File::create(db_dir.join("opencode.db")).unwrap();
+
+        let default_scan = scan_all_clients_with_scanner_settings(
+            home.to_str().unwrap(),
+            &clients,
+            false,
+            &ScannerSettings::default(),
+        );
+        assert_eq!(default_scan.get(ClientId::OpenCode).len(), 1);
+        assert_eq!(default_scan.opencode_dbs.len(), 1);
+
+        let fast_path_scan = scan_all_clients_with_scanner_settings(
+            home.to_str().unwrap(),
+            &clients,
+            false,
+            &fast_path_settings,
+        );
+        assert!(fast_path_scan.get(ClientId::OpenCode).is_empty());
+        assert_eq!(fast_path_scan.opencode_dbs.len(), 1);
     }
 
     #[test]

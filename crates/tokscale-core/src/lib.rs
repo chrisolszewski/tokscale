@@ -30,6 +30,7 @@ pub use sessionize::{
 };
 pub use sessions::{CostSource, UnifiedMessage};
 
+use chrono::TimeZone;
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -609,7 +610,53 @@ fn parse_all_messages_with_pricing(
         pricing,
         true,
         &scanner::ScannerSettings::default(),
+        TimeRangeMs::default(),
     )
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct TimeRangeMs {
+    since_ms: Option<i64>,
+    until_exclusive_ms: Option<i64>,
+}
+
+fn parse_yyyy_mm_dd(date: &str) -> Option<chrono::NaiveDate> {
+    chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()
+}
+
+fn local_midnight_ms_for_date(date: chrono::NaiveDate) -> Option<i64> {
+    let midnight = date.and_hms_opt(0, 0, 0)?;
+    match chrono::Local.from_local_datetime(&midnight) {
+        chrono::LocalResult::Single(dt) => Some(dt.timestamp_millis()),
+        chrono::LocalResult::Ambiguous(dt, _) => Some(dt.timestamp_millis()),
+        chrono::LocalResult::None => None,
+    }
+}
+
+fn report_time_range_ms(
+    since: &Option<String>,
+    until: &Option<String>,
+    year: &Option<String>,
+) -> TimeRangeMs {
+    let since_date = since.as_deref().and_then(parse_yyyy_mm_dd).or_else(|| {
+        year.as_deref()?
+            .parse::<i32>()
+            .ok()
+            .and_then(|y| chrono::NaiveDate::from_ymd_opt(y, 1, 1))
+    });
+    let until_exclusive_date = until
+        .as_deref()
+        .and_then(parse_yyyy_mm_dd)
+        .and_then(|d| d.succ_opt())
+        .or_else(|| {
+            let y = year.as_deref()?.parse::<i32>().ok()?;
+            chrono::NaiveDate::from_ymd_opt(y + 1, 1, 1)
+        });
+
+    TimeRangeMs {
+        since_ms: since_date.and_then(local_midnight_ms_for_date),
+        until_exclusive_ms: until_exclusive_date.and_then(local_midnight_ms_for_date),
+    }
 }
 
 fn parse_all_messages_with_pricing_with_env_strategy(
@@ -618,6 +665,7 @@ fn parse_all_messages_with_pricing_with_env_strategy(
     pricing: Option<&pricing::PricingService>,
     use_env_roots: bool,
     scanner_settings: &scanner::ScannerSettings,
+    opencode_sqlite_time_range: TimeRangeMs,
 ) -> Vec<UnifiedMessage> {
     #[derive(Debug)]
     struct CachedParseOutcome {
@@ -1141,20 +1189,43 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         unreachable!("uncached Codex sources return before fingerprint validation")
     }
 
+    let include_all = clients.is_empty();
+    let bounded_opencode_date_range = opencode_sqlite_time_range.since_ms.is_some()
+        || opencode_sqlite_time_range.until_exclusive_ms.is_some();
+    let bounded_opencode_only =
+        !include_all && clients.iter().all(|c| c == "opencode") && bounded_opencode_date_range;
+    let mut fast_path_scanner_settings;
+    let effective_scanner_settings = if bounded_opencode_only {
+        fast_path_scanner_settings = scanner_settings.clone();
+        fast_path_scanner_settings.skip_opencode_legacy_json_when_sqlite_exists = true;
+        &fast_path_scanner_settings
+    } else {
+        scanner_settings
+    };
+
     let scan_result = scanner::scan_all_clients_with_scanner_settings(
         home_dir,
         clients,
         use_env_roots,
-        scanner_settings,
+        effective_scanner_settings,
     );
     let headless_roots = scanner::headless_roots_with_env_strategy(home_dir, use_env_roots);
-    let mut source_cache = message_cache::SourceMessageCache::load();
-    source_cache.prune_missing_files();
     let mut all_messages: Vec<UnifiedMessage> = Vec::new();
-    let include_all = clients.is_empty();
     let include_synthetic = include_all || clients.iter().any(|c| c == "synthetic");
     let include_devin_cli = include_synthetic || clients.iter().any(|c| c == "devin-cli");
     let include_devin_desktop = include_synthetic || clients.iter().any(|c| c == "devin-desktop");
+    let bounded_opencode_sqlite_only = !include_all
+        && clients.iter().all(|c| c == "opencode")
+        && bounded_opencode_date_range
+        && !scan_result.opencode_dbs.is_empty()
+        && scan_result.get(ClientId::OpenCode).is_empty();
+    let mut source_cache = if bounded_opencode_sqlite_only {
+        message_cache::SourceMessageCache::default()
+    } else {
+        let mut cache = message_cache::SourceMessageCache::load();
+        cache.prune_missing_files();
+        cache
+    };
 
     // Parse OpenCode: prefer SQLite, collapse forked SQLite history there, then
     // suppress legacy JSON overlap by message identity.
@@ -1165,13 +1236,27 @@ fn parse_all_messages_with_pricing_with_env_strategy(
             messages,
             cache_entry,
             ..
-        } = load_or_parse_sqlite_source(
-            message_cache::CacheIdentity::for_client(ClientId::OpenCode),
-            db_path,
-            &source_cache,
-            pricing,
-            sessions::opencode::parse_opencode_sqlite,
-        );
+        } = if bounded_opencode_date_range {
+            let mut messages = sessions::opencode::parse_opencode_sqlite_with_time_range(
+                db_path,
+                opencode_sqlite_time_range.since_ms,
+                opencode_sqlite_time_range.until_exclusive_ms,
+            );
+            apply_pricing_to_messages(&mut messages, pricing);
+            CachedParseOutcome {
+                messages,
+                cache_entry: None,
+                invalidate_cache: false,
+            }
+        } else {
+            load_or_parse_sqlite_source(
+                message_cache::CacheIdentity::for_client(ClientId::OpenCode),
+                db_path,
+                &source_cache,
+                pricing,
+                sessions::opencode::parse_opencode_sqlite,
+            )
+        };
 
         // Dedup across channel-suffixed dbs: the same session can end up in
         // both `opencode.db` and `opencode-<channel>.db` if the user
@@ -2585,6 +2670,7 @@ pub async fn get_model_report(options: ReportOptions) -> Result<ModelReport, Str
         pricing.as_deref(),
         options.use_env_roots,
         &options.scanner_settings,
+        report_time_range_ms(&options.since, &options.until, &options.year),
     );
 
     let filtered = filter_messages_for_report(all_messages, &options);
@@ -2642,6 +2728,7 @@ pub async fn get_monthly_report(options: ReportOptions) -> Result<MonthlyReport,
         pricing.as_deref(),
         options.use_env_roots,
         &options.scanner_settings,
+        report_time_range_ms(&options.since, &options.until, &options.year),
     );
 
     let filtered = filter_messages_for_report(all_messages, &options);
@@ -2741,6 +2828,7 @@ pub async fn get_hourly_report(options: ReportOptions) -> Result<HourlyReport, S
         pricing.as_deref(),
         options.use_env_roots,
         &options.scanner_settings,
+        report_time_range_ms(&options.since, &options.until, &options.year),
     );
 
     let filtered = filter_messages_for_report(all_messages, &options);
@@ -2849,6 +2937,7 @@ async fn generate_graph_with_loaded_pricing(
         pricing,
         options.use_env_roots,
         &options.scanner_settings,
+        report_time_range_ms(&options.since, &options.until, &options.year),
     );
 
     let filtered = filter_messages_for_report(all_messages, &options);
@@ -2912,6 +3001,7 @@ pub async fn get_time_metrics_report(options: ReportOptions) -> Result<TimeMetri
         None,
         options.use_env_roots,
         &options.scanner_settings,
+        report_time_range_ms(&options.since, &options.until, &options.year),
     );
 
     let filtered = filter_messages_for_report(all_messages, &options);
@@ -3137,6 +3227,7 @@ fn parse_local_unified_messages_resolved(
         pricing,
         options.use_env_roots,
         &options.scanner_settings,
+        report_time_range_ms(&options.since, &options.until, &options.year),
     );
     Ok(filter_unified_messages(messages, &options))
 }
@@ -4062,6 +4153,7 @@ mod tests {
             pricing,
             false,
             &scanner::ScannerSettings::default(),
+            crate::TimeRangeMs::default(),
         )
     }
 
@@ -5331,6 +5423,7 @@ mod tests {
                 None,
                 false,
                 &scanner::ScannerSettings::default(),
+                crate::TimeRangeMs::default(),
             );
             assert_eq!(before.len(), 3, "cold scan must see all three turns");
             let before_output: i64 = before.iter().map(|m| m.tokens.output).sum();
@@ -5347,6 +5440,7 @@ mod tests {
                 None,
                 false,
                 &scanner::ScannerSettings::default(),
+                crate::TimeRangeMs::default(),
             );
 
             assert_eq!(
@@ -5376,6 +5470,7 @@ mod tests {
                 None,
                 false,
                 &scanner::ScannerSettings::default(),
+                crate::TimeRangeMs::default(),
             );
             assert_eq!(
                 third.len(),
@@ -5428,6 +5523,7 @@ mod tests {
                 None,
                 false,
                 &scanner::ScannerSettings::default(),
+                crate::TimeRangeMs::default(),
             );
             assert_eq!(before.len(), 3);
 
@@ -5444,6 +5540,7 @@ mod tests {
                 None,
                 false,
                 &scanner::ScannerSettings::default(),
+                crate::TimeRangeMs::default(),
             );
             assert_eq!(
                 after.len(),
@@ -5497,6 +5594,7 @@ mod tests {
                 None,
                 false,
                 &scanner::ScannerSettings::default(),
+                crate::TimeRangeMs::default(),
             );
             assert_eq!(
                 before.len(),
@@ -5515,6 +5613,7 @@ mod tests {
                 None,
                 false,
                 &scanner::ScannerSettings::default(),
+                crate::TimeRangeMs::default(),
             );
             assert_eq!(
                 after.len(),
@@ -5561,6 +5660,7 @@ mod tests {
                 None,
                 false,
                 &scanner::ScannerSettings::default(),
+                crate::TimeRangeMs::default(),
             );
             assert_eq!(before.len(), 2);
 
@@ -5571,6 +5671,7 @@ mod tests {
                 None,
                 false,
                 &scanner::ScannerSettings::default(),
+                crate::TimeRangeMs::default(),
             );
             assert_eq!(
                 retained.len(),
@@ -5586,6 +5687,7 @@ mod tests {
                 None,
                 false,
                 &scanner::ScannerSettings::default(),
+                crate::TimeRangeMs::default(),
             );
             assert!(
                 after.is_empty(),
@@ -8490,6 +8592,7 @@ mod tests {
             Some(&pricing),
             false,
             &scanner::ScannerSettings::default(),
+            super::TimeRangeMs::default(),
         );
 
         let embedded = messages
@@ -8538,6 +8641,7 @@ mod tests {
             Some(&pricing),
             false,
             &scanner::ScannerSettings::default(),
+            super::TimeRangeMs::default(),
         );
 
         let explicit_zero = messages
@@ -8585,6 +8689,7 @@ mod tests {
             None,
             false,
             &scanner::ScannerSettings::default(),
+            super::TimeRangeMs::default(),
         );
 
         assert_eq!(messages.len(), 1);

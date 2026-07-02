@@ -38,6 +38,11 @@ fn warn_if_escapes_home(home: &Path, client_id: ClientId, path: &Path) {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct ScannerSettings {
+    /// Runtime-only creation-time bounds for bounded OpenCode reports.
+    /// Never persist a partial scan in the whole-history source cache.
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub opencode_time_range_ms: Option<(Option<i64>, Option<i64>)>,
     /// Absolute paths to additional OpenCode SQLite databases to scan.
     ///
     /// Use this when the opencode binary was launched with `OPENCODE_DB`
@@ -2400,12 +2405,20 @@ fn scan_all_clients_with_env_strategy_inner(
             .data()
             .resolve_path_with_env_strategy(home_dir, use_env_roots);
         result.opencode_json_dir = Some(PathBuf::from(&opencode_path));
-        push_unique_scan_task(
-            &mut tasks,
-            &mut seen_scan_roots,
-            ClientId::OpenCode,
-            opencode_path,
-        );
+        let bounded_sqlite_only = scanner_settings.opencode_time_range_ms.is_some()
+            && !clients.is_empty()
+            && clients.iter().all(|client| client == "opencode")
+            && !result.opencode_dbs.is_empty();
+        if bounded_sqlite_only {
+            tasks.retain(|(client, _, _)| *client != ClientId::OpenCode);
+        } else {
+            push_unique_scan_task(
+                &mut tasks,
+                &mut seen_scan_roots,
+                ClientId::OpenCode,
+                opencode_path,
+            );
+        }
     }
 
     // MiMo Code: SQLite database(s). The primary location is the XDG data dir
@@ -4968,6 +4981,59 @@ mod tests {
         );
 
         restore_env("XDG_DATA_HOME", previous_xdg);
+    }
+
+    #[test]
+    fn test_bounded_opencode_scan_skips_legacy_only_with_sqlite_and_no_other_clients() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        setup_mock_opencode_dir(home);
+        let settings = ScannerSettings {
+            opencode_time_range_ms: Some((Some(1000), None)),
+            ..Default::default()
+        };
+        let scan = |clients: &[String], settings: &ScannerSettings| {
+            scan_all_clients_with_scanner_settings(home.to_str().unwrap(), clients, false, settings)
+        };
+        let clients = ["opencode".to_string()];
+        assert_eq!(scan(&clients, &settings).get(ClientId::OpenCode).len(), 1);
+        std::fs::write(home.join(".local/share/opencode/opencode.db"), b"").unwrap();
+        assert!(scan(&clients, &settings).get(ClientId::OpenCode).is_empty());
+        assert_eq!(
+            scan(&clients, &ScannerSettings::default())
+                .get(ClientId::OpenCode)
+                .len(),
+            1
+        );
+        assert_eq!(
+            scan(&["opencode".into(), "claude".into()], &settings)
+                .get(ClientId::OpenCode)
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn bounded_opencode_scan_also_skips_configured_legacy_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        setup_mock_opencode_dir(home);
+        let extra = home.join("extra-json");
+        std::fs::create_dir_all(extra.join("ses_extra")).unwrap();
+        std::fs::write(extra.join("ses_extra/msg_extra.json"), "{}").unwrap();
+        std::fs::write(home.join(".local/share/opencode/opencode.db"), b"").unwrap();
+        let settings = ScannerSettings {
+            opencode_time_range_ms: Some((Some(1000), None)),
+            extra_scan_paths: BTreeMap::from([("opencode".into(), vec![extra])]),
+            ..Default::default()
+        };
+        let result = scan_all_clients_with_scanner_settings(
+            home.to_str().unwrap(),
+            &["opencode".into()],
+            false,
+            &settings,
+        );
+        assert!(result.get(ClientId::OpenCode).is_empty());
     }
 
     #[test]

@@ -3116,7 +3116,22 @@ fn parse_all_messages_streaming<S: MessageSink>(
             cache_entry,
             invalidate_cache,
             ..
-        } = load_or_parse_opencode_sqlite_source(db_path, &source_cache, pricing);
+        } = if let Some((since_ms, until_exclusive_ms)) = scanner_settings.opencode_time_range_ms {
+            let mut messages = sessions::opencode::parse_opencode_sqlite_with_time_range(
+                db_path,
+                since_ms,
+                until_exclusive_ms,
+            );
+            apply_pricing_to_messages(&mut messages, pricing);
+            CachedParseOutcome {
+                messages,
+                retained_message_keys: HashSet::new(),
+                cache_entry: None,
+                invalidate_cache: false,
+            }
+        } else {
+            load_or_parse_opencode_sqlite_source(db_path, &source_cache, pricing)
+        };
         machine_labeler.label_messages(db_path, &mut messages);
 
         // Dedup across channel-suffixed dbs: the same session can end up in
@@ -5602,6 +5617,7 @@ pub async fn get_model_report(options: ReportOptions) -> Result<ModelReport, Str
 
 /// Generate model totals together with undated usage and Desktop coverage.
 pub async fn get_model_report_v2(options: ReportOptions) -> Result<ModelReportV2, String> {
+    let options = bounded_opencode_report(options);
     let start = Instant::now();
 
     let home_dir = get_home_dir_string(&options.home_dir)?;
@@ -5724,6 +5740,7 @@ fn aggregate_monthly_usage_v2_entries(
 }
 
 pub async fn get_monthly_report_v2(options: ReportOptions) -> Result<MonthlyReportV2, String> {
+    let options = bounded_opencode_report(options);
     let start = Instant::now();
 
     let home_dir = get_home_dir_string(&options.home_dir)?;
@@ -5853,6 +5870,7 @@ fn aggregate_hourly_usage_entries(
 /// Derives the hour slot from `UnifiedMessage.timestamp` (Unix ms).
 /// Falls back to date + "00:00" when timestamp is zero or missing.
 pub async fn get_hourly_report(options: ReportOptions) -> Result<HourlyReport, String> {
+    let options = bounded_opencode_report(options);
     let start = Instant::now();
 
     let home_dir = get_home_dir_string(&options.home_dir)?;
@@ -5922,6 +5940,12 @@ async fn generate_graph_with_loaded_pricing(
 ) -> Result<GraphResultV2, String> {
     let start = Instant::now();
     let captured_pricing = pricing.map(pricing::PricingService::with_cost_provenance_capture);
+    let options = if date_filter_exempt_clients.is_some_and(|clients| clients.contains("opencode"))
+    {
+        options
+    } else {
+        bounded_opencode_report(options)
+    };
     let pricing = captured_pricing.as_ref();
 
     let home_dir = get_home_dir_string(&options.home_dir)?;
@@ -6604,6 +6628,62 @@ fn validate_priced_messages(
     Err(format!(
         "pricing is unavailable for submitted token usage: {summary}"
     ))
+}
+
+fn bounded_opencode_report(mut options: ReportOptions) -> ReportOptions {
+    // Recovery reconciles sessions before date filtering, so native rows
+    // outside the requested days must remain visible to the overlay.
+    if get_home_dir_string(&options.home_dir).is_ok_and(|home| recovery::applicable(&home)) {
+        options.scanner_settings.opencode_time_range_ms = None;
+        return options;
+    }
+    fn bounds(options: &ReportOptions) -> Option<(Option<i64>, Option<i64>)> {
+        use chrono::{Datelike, NaiveDate, TimeZone};
+        let parse = |value: &str| NaiveDate::parse_from_str(value, "%Y-%m-%d").ok();
+        let mut since = match options.since.as_deref() {
+            Some(value) => Some(parse(value)?),
+            None => None,
+        };
+        let mut until = match options.until.as_deref() {
+            Some(value) => Some(parse(value)?.succ_opt()?),
+            None => None,
+        };
+        if let Some(year) = &options.year {
+            let first = NaiveDate::from_ymd_opt(year.parse().ok()?, 1, 1)?;
+            let next = NaiveDate::from_ymd_opt(first.year().checked_add(1)?, 1, 1)?;
+            since = Some(since.map_or(first, |date| date.max(first)));
+            until = Some(until.map_or(next, |date| date.min(next)));
+        }
+        if since.is_none() && until.is_none() {
+            return None;
+        }
+        let timezone = bucket_tz::BucketTimezone::from_scanner_settings(&options.scanner_settings);
+        let midnight = |date: chrono::NaiveDate| {
+            let time = date.and_hms_opt(0, 0, 0)?;
+            match &timezone {
+                bucket_tz::BucketTimezone::Local => chrono::Local
+                    .from_local_datetime(&time)
+                    .earliest()
+                    .map(|d| d.timestamp_millis()),
+                bucket_tz::BucketTimezone::Pinned(tz) => tz
+                    .from_local_datetime(&time)
+                    .earliest()
+                    .map(|d| d.timestamp_millis()),
+            }
+        };
+        Some((
+            match since {
+                Some(date) => Some(midnight(date)?),
+                None => None,
+            },
+            match until {
+                Some(date) => Some(midnight(date)?),
+                None => None,
+            },
+        ))
+    }
+    options.scanner_settings.opencode_time_range_ms = bounds(&options);
+    options
 }
 
 /// Per-message form of [`filter_messages_for_report`].
@@ -15545,6 +15625,140 @@ mod tests {
                 .unwrap();
             assert_eq!(repaired_entry.messages.len(), 1);
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn bounded_opencode_report_honors_pinned_dst_days_without_replacing_full_cache() {
+        let cache_home = tempfile::tempdir().unwrap();
+        let source_home = tempfile::tempdir().unwrap();
+        let _cache_env = redirect_cache_home(cache_home.path());
+        let data_dir = source_home.path().join(".local/share/opencode");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let path = data_dir.join("opencode.db");
+        let conn = create_timed_opencode_db(&path);
+        let times = [
+            "2026-11-01T03:59:59Z",
+            "2026-11-01T04:00:00Z",
+            "2026-11-02T04:59:59Z",
+            "2026-11-02T05:00:00Z",
+        ];
+        for (index, time) in times.iter().enumerate() {
+            let timestamp = chrono::DateTime::parse_from_rfc3339(time)
+                .unwrap()
+                .timestamp_millis();
+            let id = format!("msg-{index}");
+            let mut payload: serde_json::Value =
+                serde_json::from_str(&timed_opencode_payload(&id, 10)).unwrap();
+            payload["time"]["created"] = timestamp.into();
+            conn.execute(
+                "INSERT INTO message VALUES (?1, 'session-1', ?2, ?2, ?3)",
+                rusqlite::params![id, timestamp, payload.to_string()],
+            )
+            .unwrap();
+        }
+        let clients = vec!["opencode".to_string()];
+        assert_eq!(
+            parse_all_messages_with_pricing(source_home.path().to_str().unwrap(), &clients, None)
+                .len(),
+            4
+        );
+        let options = super::bounded_opencode_report(ReportOptions {
+            since: Some("2026-11-01".into()),
+            until: Some("2026-11-01".into()),
+            scanner_settings: scanner::ScannerSettings {
+                bucket_timezone: Some("America/New_York".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let bounded = parse_all_messages_with_pricing_with_env_strategy(
+            source_home.path().to_str().unwrap(),
+            &clients,
+            None,
+            false,
+            &options.scanner_settings,
+        );
+        assert_eq!(
+            bounded
+                .iter()
+                .map(|m| m.dedup_key.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["msg-1", "msg-2"]
+        );
+        assert!(bounded.iter().all(|m| m.date == "2026-11-01"));
+        let cache = message_cache::SourceMessageCache::load();
+        assert_eq!(
+            cache
+                .get(
+                    message_cache::CacheIdentity::for_client(ClientId::OpenCode),
+                    &path
+                )
+                .unwrap()
+                .messages
+                .len(),
+            4
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn bounded_opencode_report_preserves_recovery_session_reconciliation() {
+        let cache_home = tempfile::tempdir().unwrap();
+        let source_home = tempfile::tempdir().unwrap();
+        let _cache_env = redirect_cache_home(cache_home.path());
+        let home = source_home.path().to_str().unwrap();
+        let data_dir = source_home.path().join(".local/share/opencode");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let path = data_dir.join("opencode.db");
+        let conn = create_timed_opencode_db(&path);
+        let native_time = chrono::DateTime::parse_from_rfc3339("2026-10-30T12:00:00Z")
+            .unwrap()
+            .timestamp_millis();
+        let recovered_time = chrono::DateTime::parse_from_rfc3339("2026-11-01T12:00:00Z")
+            .unwrap()
+            .timestamp_millis();
+        let mut payload: serde_json::Value =
+            serde_json::from_str(&timed_opencode_payload("native", 10)).unwrap();
+        payload["time"]["created"] = native_time.into();
+        conn.execute(
+            "INSERT INTO message VALUES ('native', 'session-1', ?1, ?1, ?2)",
+            rusqlite::params![native_time, payload.to_string()],
+        )
+        .unwrap();
+        let clients = vec!["opencode".into()];
+        let mut recovered = parse_all_messages_with_pricing(home, &clients, None).remove(0);
+        recovered.set_timestamp(recovered_time);
+        recovered.dedup_key = Some("archived-request".into());
+        std::fs::write(
+            crate::recovery::path(),
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1, "home": home, "messages": [recovered]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let options = super::bounded_opencode_report(ReportOptions {
+            home_dir: Some(home.into()),
+            since: Some("2026-11-01".into()),
+            until: Some("2026-11-01".into()),
+            scanner_settings: scanner::ScannerSettings {
+                bucket_timezone: Some("UTC".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let messages = parse_all_messages_with_pricing_with_env_strategy(
+            home,
+            &clients,
+            None,
+            false,
+            &options.scanner_settings,
+        );
+        assert!(
+            super::filter_messages_for_report(messages, &options).is_empty(),
+            "the out-of-window native session must still suppress its recovered request"
+        );
     }
 
     /// Build a `message` table with the columns a modern OpenCode database has.

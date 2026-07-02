@@ -28,6 +28,14 @@ pub fn parse_opencode_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
     parse_opencode_schema_sqlite(db_path, OpenCodeSchemaConfig::opencode())
 }
 
+pub fn parse_opencode_sqlite_with_time_range(
+    db_path: &Path,
+    since_ms: Option<i64>,
+    until_exclusive_ms: Option<i64>,
+) -> Vec<UnifiedMessage> {
+    super::opencode_schema::parse_bounded_opencode_sqlite(db_path, since_ms, until_exclusive_ms)
+}
+
 /// Full scan that also records where a later scan can resume from.
 pub(crate) fn scan_opencode_sqlite(db_path: &Path) -> OpenCodeSchemaScan {
     scan_opencode_schema_sqlite(db_path, OpenCodeSchemaConfig::opencode())
@@ -278,6 +286,86 @@ mod tests {
         )
         .unwrap();
         conn
+    }
+
+    #[test]
+    fn bounded_sqlite_matches_full_parse_across_opencode_schemas() {
+        for v2 in [false, true] {
+            for native_time in [false, true] {
+                for metadata in [false, true] {
+                    let dir = tempfile::tempdir().unwrap();
+                    let path = dir.path().join("opencode.db");
+                    let conn = Connection::open(&path).unwrap();
+                    let (table, session_table) = if v2 {
+                        ("session_message", "session_v2")
+                    } else {
+                        ("message", "session")
+                    };
+                    let time_column = if native_time {
+                        "time_created INTEGER,"
+                    } else {
+                        ""
+                    };
+                    conn.execute_batch(&format!(
+                        "CREATE TABLE {table} (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, {time_column} data TEXT);"
+                    )).unwrap();
+                    if native_time {
+                        conn.execute_batch(&format!(
+                            "CREATE INDEX {table}_session_time_created_id_idx ON {table}(session_id, time_created, id);"
+                        )).unwrap();
+                    }
+                    if metadata {
+                        conn.execute_batch(&format!(
+                            "CREATE TABLE {session_table}(id TEXT PRIMARY KEY, directory TEXT, title TEXT);
+                             INSERT INTO {session_table} VALUES ('ses_1', '/work/project', 'A session');"
+                        )).unwrap();
+                    }
+                    for (id, time) in [("a", 1000), ("b", 2000), ("c", 3000)] {
+                        let data = serde_json::json!({
+                            "id": id, "role": "assistant", "modelID": "claude-sonnet-4", "providerID": "anthropic",
+                            "time": {"created": time},
+                            "tokens": {"input": 10, "output": 5, "cache": {"read": 0, "write": 0}}
+                        }).to_string();
+                        if native_time {
+                            conn.execute(
+                                &format!(
+                                    "INSERT INTO {table} VALUES (?1, 'ses_1', 'assistant', ?2, ?3)"
+                                ),
+                                rusqlite::params![id, time, data],
+                            )
+                            .unwrap();
+                        } else {
+                            conn.execute(
+                                &format!(
+                                    "INSERT INTO {table} VALUES (?1, 'ses_1', 'assistant', ?2)"
+                                ),
+                                rusqlite::params![id, data],
+                            )
+                            .unwrap();
+                        }
+                    }
+                    let full = parse_opencode_sqlite(&path);
+                    assert_eq!(full.len(), 3);
+                    for (since, until) in [
+                        (Some(1500), Some(3000)),
+                        (None, Some(2000)),
+                        (Some(2000), None),
+                        (None, None),
+                    ] {
+                        let expected: Vec<_> = full
+                            .iter()
+                            .filter(|m| {
+                                since.is_none_or(|t| m.timestamp >= t)
+                                    && until.is_none_or(|t| m.timestamp < t)
+                            })
+                            .cloned()
+                            .collect();
+                        assert_eq!(parse_opencode_sqlite_with_time_range(&path, since, until), expected,
+                            "v2={v2}, native_time={native_time}, metadata={metadata}, since={since:?}, until={until:?}");
+                    }
+                }
+            }
+        }
     }
 
     /// Build a database shaped like OpenCode v2 (`opencode-next.db`): an empty

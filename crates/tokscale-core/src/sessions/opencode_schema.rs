@@ -1268,6 +1268,82 @@ fn refresh_changed_session_metadata(
     read_metadata_high_water(db_path, conn, stats_query)
 }
 
+/// Parse `[since_ms, until_exclusive_ms)` without building a whole-history cache.
+pub(crate) fn parse_bounded_opencode_sqlite(
+    db_path: &Path,
+    since_ms: Option<i64>,
+    until_exclusive_ms: Option<i64>,
+) -> Vec<UnifiedMessage> {
+    if since_ms.is_none() && until_exclusive_ms.is_none() {
+        return parse_opencode_schema_sqlite(db_path, OpenCodeSchemaConfig::opencode());
+    }
+    let Some(conn) = open_readonly_sqlite_snapshot(db_path) else {
+        return Vec::new();
+    };
+    let cfg = OpenCodeSchemaConfig {
+        incremental_groups: None,
+        ..OpenCodeSchemaConfig::opencode()
+    };
+    let mut acc = SchemaAccumulator::default();
+    for (table, alias, queries) in [
+        ("session_message", "sm", OPENCODE_V2_QUERIES),
+        ("message", "m", OPENCODE_V1_QUERIES),
+    ] {
+        let native_time = conn
+            .prepare(&format!("SELECT time_created FROM {table} LIMIT 0"))
+            .is_ok();
+        let time = if native_time {
+            format!("{alias}.time_created")
+        } else {
+            format!("CAST(json_extract({alias}.data, '$.time.created') AS REAL)")
+        };
+        // Prefer a date index; older v1 databases only have the composite
+        // session/time index, which still avoids reading historical blobs.
+        let source = format!("{table} {alias}");
+        let indexed_source = native_time
+            .then(|| {
+                [
+                    format!("{table}_time_created_idx"),
+                    format!("{table}_session_time_created_id_idx"),
+                ]
+                .into_iter()
+                .map(|index| format!("{source} INDEXED BY {index}"))
+                .find(|source| {
+                    conn.prepare(&format!("SELECT {alias}.id FROM {source} LIMIT 0"))
+                        .is_ok()
+                })
+            })
+            .flatten()
+            .unwrap_or_else(|| source.clone());
+        // Bounds are typed integers, not SQL input. Put them before the JSON
+        // predicates so rejected historical rows never decode their payloads.
+        let bounds = [
+            since_ms.map(|value| format!("{time} >= {value}")),
+            until_exclusive_ms.map(|value| format!("{time} < {value}")),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" AND ");
+        for query in queries {
+            let query = query
+                .replacen(
+                    &format!("FROM {source}"),
+                    &format!("FROM {indexed_source}"),
+                    1,
+                )
+                .replacen("WHERE ", &format!("WHERE {bounds} AND "), 1);
+            let scan = collect_rows(db_path, &conn, &query, &mut |row| {
+                acc.ingest(row, &cfg, "", None);
+            });
+            if scan.prepared() {
+                break;
+            }
+        }
+    }
+    acc.messages
+}
+
 /// Parse assistant turns out of a SQLite database that uses the OpenCode
 /// message schema, applying `cfg`'s per-client policy.
 ///

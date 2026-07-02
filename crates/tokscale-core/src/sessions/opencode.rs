@@ -201,36 +201,80 @@ pub fn parse_opencode_file(path: &Path) -> Option<UnifiedMessage> {
 }
 
 pub fn parse_opencode_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
+    parse_opencode_sqlite_with_time_range(db_path, None, None)
+}
+
+pub fn parse_opencode_sqlite_with_time_range(
+    db_path: &Path,
+    since_ms: Option<i64>,
+    until_exclusive_ms: Option<i64>,
+) -> Vec<UnifiedMessage> {
     let Some(conn) = open_readonly_sqlite(db_path) else {
         return Vec::new();
     };
 
-    let modern_query = r#"
+    // Real OpenCode DBs expose a top-level `time_created` INTEGER column that
+    // mirrors `json_extract(data, '$.time.created')`. Filtering on it lets
+    // SQLite skip decoding the (potentially multi-GB) `data` blobs for
+    // out-of-range rows. Fall back to the JSON extract when the column is
+    // absent so a bounded scan degrades to slow-but-correct.
+    let time_col = if conn
+        .prepare("SELECT time_created FROM message LIMIT 0")
+        .is_ok()
+    {
+        "m.time_created"
+    } else {
+        "CAST(json_extract(m.data, '$.time.created') AS REAL)"
+    };
+
+    let modern_query = |message_source: &str| {
+        format!(
+            r#"
         SELECT m.id, m.session_id, m.data, NULLIF(s.directory, '') AS workspace_root
-        FROM message m
+        FROM {message_source}
         LEFT JOIN session s ON s.id = m.session_id
         WHERE json_extract(m.data, '$.role') = 'assistant'
           AND json_extract(m.data, '$.tokens') IS NOT NULL
+          AND (?1 IS NULL OR {time_col} >= ?1)
+          AND (?2 IS NULL OR {time_col} < ?2)
         ORDER BY m.id, m.session_id
-    "#;
+    "#
+        )
+    };
 
-    let legacy_query = r#"
+    let legacy_query = |message_source: &str| {
+        format!(
+            r#"
         SELECT m.id, m.session_id, m.data, NULL AS workspace_root
-        FROM message m
+        FROM {message_source}
         WHERE json_extract(m.data, '$.role') = 'assistant'
           AND json_extract(m.data, '$.tokens') IS NOT NULL
+          AND (?1 IS NULL OR {time_col} >= ?1)
+          AND (?2 IS NULL OR {time_col} < ?2)
         ORDER BY m.id, m.session_id
-    "#;
+    "#
+        )
+    };
+
+    let indexed_message_source = "message m INDEXED BY message_session_time_created_id_idx";
+    let plain_message_source = "message m";
+    let modern_indexed_query = modern_query(indexed_message_source);
+    let modern_plain_query = modern_query(plain_message_source);
+    let legacy_indexed_query = legacy_query(indexed_message_source);
+    let legacy_plain_query = legacy_query(plain_message_source);
 
     let mut stmt = match conn
-        .prepare(modern_query)
-        .or_else(|_| conn.prepare(legacy_query))
+        .prepare(&modern_indexed_query)
+        .or_else(|_| conn.prepare(&modern_plain_query))
+        .or_else(|_| conn.prepare(&legacy_indexed_query))
+        .or_else(|_| conn.prepare(&legacy_plain_query))
     {
         Ok(s) => s,
         Err(_) => return Vec::new(),
     };
 
-    let rows = match stmt.query_map([], |row| {
+    let params = rusqlite::params![since_ms, until_exclusive_ms];
+    let rows = match stmt.query_map(params, |row| {
         let id: String = row.get(0)?;
         let session_id: String = row.get(1)?;
         let data_json: String = row.get(2)?;
@@ -495,6 +539,60 @@ mod tests {
         )
         .unwrap();
         conn
+    }
+
+    #[test]
+    fn test_parse_opencode_sqlite_with_time_range_uses_native_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("opencode.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE message (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                time_created INTEGER NOT NULL,
+                data TEXT NOT NULL
+            );
+            CREATE INDEX message_session_time_created_id_idx ON message (session_id, time_created, id);",
+        )
+        .unwrap();
+
+        for (id, t) in [("msg_a", 1000i64), ("msg_b", 2000), ("msg_c", 3000)] {
+            let data = format!(
+                r#"{{"role":"assistant","modelID":"claude-sonnet-4","providerID":"anthropic","tokens":{{"input":10,"output":5,"reasoning":0,"cache":{{"read":0,"write":0}}}},"time":{{"created":{t}.0}}}}"#
+            );
+            conn.execute(
+                "INSERT INTO message (id, session_id, time_created, data) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![id, "ses_1", t, data],
+            )
+            .unwrap();
+        }
+
+        let messages = parse_opencode_sqlite_with_time_range(&db_path, Some(1500), Some(3000));
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].dedup_key.as_deref(), Some("msg_b"));
+    }
+
+    #[test]
+    fn test_parse_opencode_sqlite_with_time_range_falls_back_without_native_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("opencode.db");
+        let conn = create_opencode_sqlite_db(&db_path);
+
+        for (id, t) in [("msg_a", 1000i64), ("msg_b", 2000), ("msg_c", 3000)] {
+            let data = format!(
+                r#"{{"role":"assistant","modelID":"claude-sonnet-4","providerID":"anthropic","tokens":{{"input":10,"output":5,"reasoning":0,"cache":{{"read":0,"write":0}}}},"time":{{"created":{t}.0}}}}"#
+            );
+            conn.execute(
+                "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
+                rusqlite::params![id, "ses_1", data],
+            )
+            .unwrap();
+        }
+
+        let messages = parse_opencode_sqlite_with_time_range(&db_path, Some(1500), Some(3000));
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].dedup_key.as_deref(), Some("msg_b"));
     }
 
     #[test]
